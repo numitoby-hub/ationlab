@@ -1,4 +1,54 @@
-.DS_Store
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# PyTorch / ML
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.bin
+
+# Data & cache
+*.h5
+*.hdf5
+*.npy
+*.npz
+graph_cache*/
+
+# Papers
 archcad/papers/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets / credentials
+.env
+*.key
+credentials.json
+
+# Large files
+*.zip
+*.tar.gz
+*.tar
+*.gz
