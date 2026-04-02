@@ -3,9 +3,7 @@ from torch.utils.data import Dataset
 from scipy.spatial import cKDTree
 from collections import defaultdict
 from config import *
-
-def get_class_id(semantic_id):
-    return RAW_TO_NEW_CLASS.get(semantic_id, 30)
+from utils import get_class_id
 
 class PanCADDataset(Dataset):
     def __init__(self, file_ids, j_dict, p_dict, img_size=IMG_SIZE):
@@ -49,7 +47,6 @@ class PanCADDataset(Dataset):
                 'edge_index_list': eil, 'edge_attr_list': eal,
                 'starts': torch.tensor(starts, dtype=torch.float32),
                 'ends': torch.tensor(ends, dtype=torch.float32),
-                'centers': torch.tensor(centers, dtype=torch.float32),
                 'gt_labels': gt_labels, 'gt_masks': gt_masks,
                 'sem_labels': torch.tensor(sem_labels, dtype=torch.long), 'num_primitives': N}
 
@@ -103,6 +100,6 @@ class PanCADDataset(Dataset):
         ea = torch.zeros(0, EDGE_FEAT_DIM)
         return {'image': img, 'geo_features': torch.zeros(1, GEO_FEAT_DIM),
                 'edge_index_list': [ee]*len(GRAPH_K_LIST), 'edge_attr_list': [ea]*len(GRAPH_K_LIST),
-                'starts': torch.zeros(1,2), 'ends': torch.zeros(1,2), 'centers': torch.zeros(1,2),
+                'starts': torch.zeros(1,2), 'ends': torch.zeros(1,2),
                 'gt_labels': torch.zeros(0, dtype=torch.long), 'gt_masks': torch.zeros(0,1),
                 'sem_labels': torch.zeros(1, dtype=torch.long), 'num_primitives': 1}

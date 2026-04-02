@@ -5,6 +5,7 @@ from sklearn.metrics import f1_score
 from torch.utils.data import Dataset, DataLoader, Subset
 from config import *
 from step2_model import PanCADNetV2, PanopticLoss
+from step4_eval import extract_pred_instances, extract_gt_instances, compute_iou_log, compute_pq
 from utils import get_valid_files
 
 TOTAL_EPOCHS      = 30
@@ -63,66 +64,6 @@ def make_loader(dataset, n_samples, batch_size, shuffle=True):
     return DataLoader(Subset(dataset, indices),
                       batch_size=batch_size, shuffle=shuffle,
                       num_workers=2, collate_fn=collate_batch, pin_memory=True)
-
-
-# ── PQ 헬퍼 (step4와 동일) ────────────────────────────────────────
-def extract_pred_instances(pc, pm, threshold=0.5):
-    probs = pc.softmax(-1)
-    scores, labels = probs[:, :-1].max(-1)
-    masks = (pm.sigmoid() > 0.5)
-    instances = []
-    for q in range(pc.shape[0]):
-        if scores[q] < threshold: continue
-        ents = masks[q].nonzero(as_tuple=True)[0].cpu().tolist()
-        if ents:
-            instances.append({'label': labels[q].item(),
-                               'entities': ents, 'score': scores[q].item()})
-    return instances
-
-def extract_gt_instances(gl, gm):
-    instances = []
-    for m in range(gl.shape[0]):
-        ents = gm[m].nonzero(as_tuple=True)[0].cpu().tolist()
-        if ents:
-            instances.append({'label': gl[m].item(), 'entities': ents})
-    return instances
-
-def compute_iou_log(pred_ents, gt_ents, el):
-    inter = set(pred_ents) & set(gt_ents)
-    union = set(pred_ents) | set(gt_ents)
-    if not union: return 0.0
-    iw = sum(np.log(1 + el.get(e, 0)) for e in inter)
-    uw = sum(np.log(1 + el.get(e, 0)) for e in union)
-    return iw / (uw + 1e-8)
-
-def compute_pq_sample(pred_inst, gt_inst, el, nc):
-    pq, sq, rq = {}, {}, {}
-    for cid in range(nc):
-        pc = [p for p in pred_inst if p['label'] == cid]
-        gc = [g for g in gt_inst  if g['label'] == cid]
-        if not gc and not pc: continue
-        TP, FP, FN, iou_sum = 0, 0, 0, 0.0
-        matched = set()
-        if cid in STUFF_CLASSES:
-            if not pc or not gc: FP += len(pc); FN += len(gc)
-            else:
-                iou = compute_iou_log(pc[0]['entities'], gc[0]['entities'], el)
-                if iou > 0.5: TP, iou_sum = 1, iou
-                else: FP, FN = 1, 1
-        else:
-            for p in pc:
-                bi, bg = 0.0, -1
-                for gi, g in enumerate(gc):
-                    iou = compute_iou_log(p['entities'], g['entities'], el)
-                    if iou > bi: bi, bg = iou, gi
-                if bi > 0.5 and bg not in matched:
-                    TP += 1; iou_sum += bi; matched.add(bg)
-                else: FP += 1
-            FN = len(gc) - len(matched)
-        r = TP / (TP + 0.5 * FP + 0.5 * FN + 1e-8)
-        s = iou_sum / (TP + 1e-8) if TP > 0 else 0.0
-        pq[cid], sq[cid], rq[cid] = r * s, s, r
-    return pq, sq, rq
 
 
 # ── Train ────────────────────────────────────────────────────────
@@ -247,7 +188,7 @@ def evaluate_pq(model, ds):
         el = {i: float(sample['geo_features'][i, 0].item() * SCALE_ORG)
               for i in range(sample['num_primitives'])}
 
-        p, sq_d, r = compute_pq_sample(pi, gi, el, NUM_GNN_CLS)
+        p, sq_d, r = compute_pq(pi, gi, el, NUM_GNN_CLS)
         for cid in p:
             cpq[cid] += p[cid]; csq[cid] += sq_d[cid]
             crq[cid] += r[cid]; cc[cid]  += 1
