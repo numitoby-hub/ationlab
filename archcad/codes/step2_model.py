@@ -224,20 +224,27 @@ class PanopticLoss(nn.Module):
             n      = 2 * (s * mg).sum(-1)
             d      = s.sum(-1) + mg.sum(-1)
             l_dice = (1 - (n + 1) / (d + 1)).mean()
+
+            # overlap 패널티: 매칭된 쿼리들의 mask 합이 1을 초과하면 벌점
+            overlap = F.relu(s.sum(0) - 1.0)          # (N,) — 초과분만
+            l_overlap = overlap.mean()
         else:
-            l_bce  = torch.tensor(0., device=dev)
-            l_dice = torch.tensor(0., device=dev)
+            l_bce     = torch.tensor(0., device=dev)
+            l_dice    = torch.tensor(0., device=dev)
+            l_overlap = torch.tensor(0., device=dev)
 
         # semantic loss (논문과 동일, primitive 단위 CE)
         l_sem = F.cross_entropy(sem, sem_labels.to(dev), reduction='mean')
 
-        total = self.lc * l_cls + self.lb * l_bce + self.ld * l_dice + l_sem
+        total = (self.lc * l_cls + self.lb * l_bce + self.ld * l_dice
+                 + l_sem + 2.0 * l_overlap)
         return total, {
-            'loss_cls':  l_cls.item(),
-            'loss_bce':  l_bce.item(),
-            'loss_dice': l_dice.item(),
-            'loss_sem':  l_sem.item(),
-            'total':     total.item(),
+            'loss_cls':     l_cls.item(),
+            'loss_bce':     l_bce.item(),
+            'loss_dice':    l_dice.item(),
+            'loss_sem':     l_sem.item(),
+            'loss_overlap': l_overlap.item(),
+            'total':        total.item(),
         }
 
 

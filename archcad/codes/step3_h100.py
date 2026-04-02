@@ -129,7 +129,7 @@ def compute_pq_sample(pred_inst, gt_inst, el, nc):
 def train_one_epoch(model, dl, criterion, optimizer, scaler, epoch):
     model.train()
     total_loss, steps = 0, 0
-    d = {'loss_cls': 0, 'loss_bce': 0, 'loss_dice': 0, 'loss_sem': 0}
+    d = {'loss_cls': 0, 'loss_bce': 0, 'loss_dice': 0, 'loss_sem': 0, 'loss_overlap': 0}
     for batch in tqdm(dl, desc=f"Train {epoch+1}/{TOTAL_EPOCHS}", leave=False):
         if batch is None: continue
         img     = batch['image'].to(DEVICE)
@@ -327,7 +327,8 @@ if __name__ == "__main__":
               f"(cls:{td.get('loss_cls',0):.3f} "
               f"bce:{td.get('loss_bce',0):.3f} "
               f"dice:{td.get('loss_dice',0):.3f} "
-              f"sem:{td.get('loss_sem',0):.3f}) | "
+              f"sem:{td.get('loss_sem',0):.3f} "
+              f"ovlp:{td.get('loss_overlap',0):.3f}) | "
               f"Val {vl:.4f} | "
               f"F1 {f1_mac*100:.2f}% / wF1 {f1_wgt*100:.2f}% | "
               f"LR {lr:.2e}")
