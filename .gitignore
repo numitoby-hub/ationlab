@@ -42,10 +42,14 @@ Thumbs.db
 *.swp
 *.swo
 
+# Claude
+CLAUDE.md
+
 # Secrets / credentials
 .env
 *.key
 credentials.json
+.mcp.json
 
 # Large files
 *.zip
