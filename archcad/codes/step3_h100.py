@@ -129,7 +129,7 @@ def compute_pq_sample(pred_inst, gt_inst, el, nc):
 def train_one_epoch(model, dl, criterion, optimizer, scaler, epoch):
     model.train()
     total_loss, steps = 0, 0
-    d = {'loss_cls': 0, 'loss_bce': 0, 'loss_dice': 0, 'loss_sem': 0, 'loss_overlap': 0}
+    d = {'loss_cls': 0, 'loss_bce': 0, 'loss_dice': 0, 'loss_sem': 0, 'loss_overlap': 0, 'loss_aux': 0}
     for batch in tqdm(dl, desc=f"Train {epoch+1}/{TOTAL_EPOCHS}", leave=False):
         if batch is None: continue
         img     = batch['image'].to(DEVICE)
@@ -142,17 +142,17 @@ def train_one_epoch(model, dl, criterion, optimizer, scaler, epoch):
         sem_all = batch['sem_labels'].to(DEVICE)   # (N_total,)
         optimizer.zero_grad()
         with torch.amp.autocast('cuda'):
-            pc_list, pm_list, sem_list = model(img, s, e, geo, eil, eal, bidx)
+            pc_list, pm_list, sem_list, aux_list = model(img, s, e, geo, eil, eal, bidx)
             loss   = torch.tensor(0., device=DEVICE)
             valid  = 0
             offset = 0
-            for pc, pm, sem, gl, gm, N in zip(
-                    pc_list, pm_list, sem_list,
+            for pc, pm, sem, aux, gl, gm, N in zip(
+                    pc_list, pm_list, sem_list, aux_list,
                     batch['gt_labels'], batch['gt_masks'], batch['num_primitives']):
                 gl, gm  = gl.to(DEVICE), gm.to(DEVICE)
                 sem_lbl = sem_all[offset:offset + N]
                 offset += N
-                l, ld   = criterion(pc, pm, sem, gl, gm, sem_lbl)
+                l, ld   = criterion(pc, pm, sem, gl, gm, sem_lbl, aux_outputs=aux)
                 loss    = loss + l
                 for k in d: d[k] += ld.get(k, 0)
                 valid  += 1
@@ -187,17 +187,17 @@ def validate(model, dl, criterion):
         sem_all = batch['sem_labels'].to(DEVICE)
 
         with torch.amp.autocast('cuda'):
-            pc_list, pm_list, sem_list = model(img, s, e, geo, eil, eal, bidx)
+            pc_list, pm_list, sem_list, aux_list = model(img, s, e, geo, eil, eal, bidx)
             loss   = torch.tensor(0., device=DEVICE)
             valid  = 0
             offset = 0
-            for pc, pm, sem, gl, gm, N in zip(
-                    pc_list, pm_list, sem_list,
+            for pc, pm, sem, aux, gl, gm, N in zip(
+                    pc_list, pm_list, sem_list, aux_list,
                     batch['gt_labels'], batch['gt_masks'], batch['num_primitives']):
                 gl_d, gm_d = gl.to(DEVICE), gm.to(DEVICE)
                 sem_lbl    = sem_all[offset:offset + N]
                 offset    += N
-                l, _       = criterion(pc, pm, sem, gl_d, gm_d, sem_lbl)
+                l, _       = criterion(pc, pm, sem, gl_d, gm_d, sem_lbl, aux_outputs=aux)
                 loss = loss + l; valid += 1
 
                 # ── 논문 방식: sem_logits argmax → wF1 ──────────
@@ -238,7 +238,7 @@ def evaluate_pq(model, ds):
         bidx = torch.zeros(sample['num_primitives'], dtype=torch.long, device=DEVICE)
 
         with torch.amp.autocast('cuda'):
-            pc_list, pm_list, _ = model(img, s, e, geo, eil, eal, bidx)
+            pc_list, pm_list, _, _ = model(img, s, e, geo, eil, eal, bidx)
         pc = pc_list[0].float().cpu()
         pm = pm_list[0].float().cpu()
 
@@ -328,7 +328,8 @@ if __name__ == "__main__":
               f"bce:{td.get('loss_bce',0):.3f} "
               f"dice:{td.get('loss_dice',0):.3f} "
               f"sem:{td.get('loss_sem',0):.3f} "
-              f"ovlp:{td.get('loss_overlap',0):.3f}) | "
+              f"ovlp:{td.get('loss_overlap',0):.3f} "
+              f"aux:{td.get('loss_aux',0):.3f}) | "
               f"Val {vl:.4f} | "
               f"F1 {f1_mac*100:.2f}% / wF1 {f1_wgt*100:.2f}% | "
               f"LR {lr:.2e}")

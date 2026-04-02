@@ -104,7 +104,7 @@ if __name__ == "__main__":
             bidx = torch.zeros(sample['num_primitives'], dtype=torch.long, device=DEVICE)
 
             with torch.amp.autocast('cuda'):
-                pc_list, pm_list, sem_list = model(img, s, e, geo, eil, eal, bidx)
+                pc_list, pm_list, sem_list, _ = model(img, s, e, geo, eil, eal, bidx)
 
             pc  = pc_list[0].float().cpu()
             pm  = pm_list[0].float().cpu()
