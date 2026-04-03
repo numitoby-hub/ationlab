@@ -1,15 +1,15 @@
 import os
 import torch
 
-BASE_DIR      = "/content/drive/MyDrive/archcad"
-DATA_DIR      = "/content/local_data/data"
-CACHE_DIR     = "/content/mask_cache"
+BASE_DIR      = r"C:\Users\user\Documents\ysu\ArchCAD"
+DATA_DIR      = os.path.join(BASE_DIR, "data")
+CACHE_DIR     = os.path.join(BASE_DIR, "mask_cache")
 JSON_DIR      = os.path.join(DATA_DIR, "json", "json")
 PNG_DIR       = os.path.join(DATA_DIR, "png", "png")
 SEGFORMER_OUT = os.path.join(BASE_DIR, "segformer_output")
 GATV2_OUT     = os.path.join(BASE_DIR, "gatv2_output")
 MODEL_OUT     = os.path.join(BASE_DIR, "pancadnet_v2_output")
-GRAPH_DIR     = "/content/graph_cache_v2"
+GRAPH_DIR     = os.path.join(BASE_DIR, "graph_cache_v3")
 
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 IMG_SIZE      = 700
