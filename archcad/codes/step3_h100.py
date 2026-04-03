@@ -69,7 +69,7 @@ def make_loader(dataset, n_samples, batch_size, shuffle=True):
 
 
 # ── Train ────────────────────────────────────────────────────────
-def train_one_epoch(model, dl, criterion, optimizer, scaler, epoch):
+def train_one_epoch(model, dl, criterion, optimizer, epoch):
     model.train()
     total_loss, steps = 0, 0
     d = {'loss_cls': 0, 'loss_bce': 0, 'loss_dice': 0, 'loss_sem': 0, 'loss_overlap': 0, 'loss_aux': 0}
@@ -84,7 +84,7 @@ def train_one_epoch(model, dl, criterion, optimizer, scaler, epoch):
         bidx    = batch['batch_idx'].to(DEVICE)
         sem_all = batch['sem_labels'].to(DEVICE)   # (N_total,)
         optimizer.zero_grad()
-        with torch.amp.autocast('cuda'):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             pc_list, pm_list, sem_list, aux_list = model(img, s, e, geo, eil, eal, bidx)
             loss   = torch.tensor(0., device=DEVICE)
             valid  = 0
@@ -100,14 +100,11 @@ def train_one_epoch(model, dl, criterion, optimizer, scaler, epoch):
                 for k in d: d[k] += ld.get(k, 0)
                 valid  += 1
             if valid > 0: loss = loss / valid
-        if not torch.isfinite(loss) or loss.item() > 100:
+        if not torch.isfinite(loss):
             optimizer.zero_grad(); continue
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-        if torch.isfinite(grad_norm):
-            scaler.step(optimizer)
-        scaler.update()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
         total_loss += loss.item(); steps += 1
     if steps == 0: return 0, {}
     return total_loss / steps, {k: v / steps for k, v in d.items()}
@@ -131,7 +128,7 @@ def validate(model, dl, criterion):
         bidx    = batch['batch_idx'].to(DEVICE)
         sem_all = batch['sem_labels'].to(DEVICE)
 
-        with torch.amp.autocast('cuda'):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             pc_list, pm_list, sem_list, aux_list = model(img, s, e, geo, eil, eal, bidx)
             loss   = torch.tensor(0., device=DEVICE)
             valid  = 0
@@ -184,7 +181,7 @@ def evaluate_pq(model, ds):
         eal  = [x.to(DEVICE) for x in sample['edge_attr_list']]
         bidx = torch.zeros(sample['num_primitives'], dtype=torch.long, device=DEVICE)
 
-        with torch.amp.autocast('cuda'):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             pc_list, pm_list, _, _ = model(img, s, e, geo, eil, eal, bidx)
         pc = pc_list[0].float().cpu()
         pm = pm_list[0].float().cpu()
@@ -266,7 +263,7 @@ if __name__ == "__main__":
         progress = (epoch - WARMUP_EPOCHS) / (TOTAL_EPOCHS - WARMUP_EPOCHS)
         return 0.5 * (1 + np.cos(np.pi * progress))  # cosine decay
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler = torch.amp.GradScaler('cuda')
+    # bf16 doesn't need GradScaler (same exponent range as fp32)
 
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     print(f"GPU: {torch.cuda.get_device_name()}\n")
@@ -274,7 +271,7 @@ if __name__ == "__main__":
     best_val = float('inf')
     for epoch in range(TOTAL_EPOCHS):
         train_dl = make_loader(train_ds, SAMPLES_PER_EPOCH, BATCH_SIZE)
-        tl, td   = train_one_epoch(model, train_dl, criterion, optimizer, scaler, epoch)
+        tl, td   = train_one_epoch(model, train_dl, criterion, optimizer, epoch)
         vl, f1_mac, f1_wgt = validate(model, val_dl, criterion)
         scheduler.step()
         lr = optimizer.param_groups[1]['lr']

@@ -213,6 +213,7 @@ class PrimitiveMask2FormerDecoder(nn.Module):
 
         # semantic branch (논문 방식, F1/wF1 계산용)
         sem_logits = self.sem_head(fused)            # (N, C)
+        sem_logits = sem_logits.clamp(-30, 30)       # fp16 overflow 방지
 
         return cls, masks, sem_logits, aux_outputs
 
@@ -297,8 +298,9 @@ class PanopticLoss(nn.Module):
         # main loss (최종 layer)
         main_loss, l_cls, l_bce, l_dice, l_overlap = self._single_loss(pc, pm, gl, gm, dev)
 
-        # semantic loss
-        l_sem = F.cross_entropy(sem, sem_labels.to(dev), reduction='mean')
+        # semantic loss (가중치 0.5: panoptic loss와 균형)
+        l_sem = 0.5 * F.cross_entropy(sem, sem_labels.to(dev), reduction='mean',
+                                       label_smoothing=0.1)
 
         # auxiliary loss (중간 layer들, 가중치 0.5)
         l_aux = torch.tensor(0., device=dev)
