@@ -100,7 +100,7 @@ def train_one_epoch(model, dl, criterion, optimizer, scaler, epoch):
                 for k in d: d[k] += ld.get(k, 0)
                 valid  += 1
             if valid > 0: loss = loss / valid
-        if not torch.isfinite(loss) or loss.item() > 20:
+        if not torch.isfinite(loss) or loss.item() > 100:
             optimizer.zero_grad(); continue
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
