@@ -9,7 +9,7 @@ from step4_eval import extract_pred_instances, extract_gt_instances, compute_iou
 from utils import get_valid_files
 
 TOTAL_EPOCHS      = 30
-BATCH_SIZE        = 8
+BATCH_SIZE        = 16
 SAMPLES_PER_EPOCH = 20000
 
 
