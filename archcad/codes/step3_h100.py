@@ -5,7 +5,7 @@ from sklearn.metrics import f1_score
 from torch.utils.data import Dataset, DataLoader, Subset
 from config import *
 from step2_model import PanCADNetV2, PanopticLoss
-from step4_eval import extract_pred_instances, extract_gt_instances, compute_iou_log, compute_pq
+from step4_eval import extract_pred_instances, extract_gt_instances, compute_iou_log, match_instances
 from utils import get_valid_files
 
 TOTAL_EPOCHS      = 30
@@ -23,8 +23,10 @@ class CachedDataset(Dataset):
         return torch.load(self.paths[idx], weights_only=False)
 
 
+MAX_PRIMITIVES = 3000
+
 def collate_batch(samples):
-    samples = [s for s in samples if s['num_primitives'] >= 2]
+    samples = [s for s in samples if 2 <= s['num_primitives'] <= MAX_PRIMITIVES]
     if not samples: return None
     images    = torch.stack([s['image'] for s in samples])
     Ns        = [s['num_primitives'] for s in samples]
@@ -98,12 +100,14 @@ def train_one_epoch(model, dl, criterion, optimizer, scaler, epoch):
                 for k in d: d[k] += ld.get(k, 0)
                 valid  += 1
             if valid > 0: loss = loss / valid
-        if not torch.isfinite(loss):
+        if not torch.isfinite(loss) or loss.item() > 100:
             optimizer.zero_grad(); continue
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer); scaler.update()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        if torch.isfinite(grad_norm):
+            scaler.step(optimizer)
+        scaler.update()
         total_loss += loss.item(); steps += 1
     if steps == 0: return 0, {}
     return total_loss / steps, {k: v / steps for k, v in d.items()}
@@ -165,8 +169,10 @@ def evaluate_pq(model, ds):
     dl = DataLoader(ds, batch_size=1, shuffle=False,
                     num_workers=2, collate_fn=lambda b: b[0])
 
-    cpq = defaultdict(float); csq = defaultdict(float)
-    crq = defaultdict(float); cc  = defaultdict(int)
+    tp_cls = np.zeros(NUM_GNN_CLS, dtype=np.float64)
+    fp_cls = np.zeros(NUM_GNN_CLS, dtype=np.float64)
+    fn_cls = np.zeros(NUM_GNN_CLS, dtype=np.float64)
+    iou_cls = np.zeros(NUM_GNN_CLS, dtype=np.float64)
 
     for sample in tqdm(dl, desc="  PQ eval", leave=False):
         if sample['num_primitives'] < 2: continue
@@ -188,40 +194,44 @@ def evaluate_pq(model, ds):
         el = {i: float(sample['geo_features'][i, 0].item() * SCALE_ORG)
               for i in range(sample['num_primitives'])}
 
-        p, sq_d, r = compute_pq(pi, gi, el, NUM_GNN_CLS)
-        for cid in p:
-            cpq[cid] += p[cid]; csq[cid] += sq_d[cid]
-            crq[cid] += r[cid]; cc[cid]  += 1
+        for cid in range(NUM_GNN_CLS):
+            tp, fp, fn, iou_s = match_instances(pi, gi, el, cid)
+            tp_cls[cid] += tp
+            fp_cls[cid] += fp
+            fn_cls[cid] += fn
+            iou_cls[cid] += iou_s
 
-    def avg(ms, cls_list):
-        v = [c for c in cls_list if cc[c] > 0]
-        return sum(ms[c] / cc[c] for c in v) / len(v) * 100 if v else 0.0
+    RQ = tp_cls / (tp_cls + 0.5 * fp_cls + 0.5 * fn_cls + 1e-8)
+    SQ = iou_cls / (tp_cls + 1e-8)
+    SQ[tp_cls == 0] = 0.0
+    PQ = RQ * SQ
+
+    def cls_avg(arr, cls_list):
+        valid = [c for c in cls_list if (tp_cls[c] + fp_cls[c] + fn_cls[c]) > 0]
+        return np.mean(arr[valid]) * 100 if valid else 0.0
 
     print("\n" + "=" * 60)
-    print("Val PQ Results")
+    print("Val PQ Results (global)")
     print(f"{'':8s} {'PQ':>7} {'SQ':>7} {'RQ':>7}")
     print("-" * 40)
-    print(f"{'Total':8s} {avg(cpq, range(NUM_GNN_CLS)):6.2f}%"
-          f" {avg(csq, range(NUM_GNN_CLS)):6.2f}%"
-          f" {avg(crq, range(NUM_GNN_CLS)):6.2f}%")
-    print(f"{'Thing':8s} {avg(cpq, THING_CLASSES):6.2f}%"
-          f" {avg(csq, THING_CLASSES):6.2f}%"
-          f" {avg(crq, THING_CLASSES):6.2f}%")
-    print(f"{'Stuff':8s} {avg(cpq, STUFF_CLASSES):6.2f}%"
-          f" {avg(csq, STUFF_CLASSES):6.2f}%"
-          f" {avg(crq, STUFF_CLASSES):6.2f}%")
+    print(f"{'Total':8s} {cls_avg(PQ, range(NUM_GNN_CLS)):6.2f}%"
+          f" {cls_avg(SQ, range(NUM_GNN_CLS)):6.2f}%"
+          f" {cls_avg(RQ, range(NUM_GNN_CLS)):6.2f}%")
+    print(f"{'Thing':8s} {cls_avg(PQ, THING_CLASSES):6.2f}%"
+          f" {cls_avg(SQ, THING_CLASSES):6.2f}%"
+          f" {cls_avg(RQ, THING_CLASSES):6.2f}%")
+    print(f"{'Stuff':8s} {cls_avg(PQ, STUFF_CLASSES):6.2f}%"
+          f" {cls_avg(SQ, STUFF_CLASSES):6.2f}%"
+          f" {cls_avg(RQ, STUFF_CLASSES):6.2f}%")
     print("-" * 60)
-    print(f"{'Type':5s}  {'Class':20s} {'PQ':>6} {'SQ':>6} {'RQ':>6}  n")
+    print(f"{'Type':5s}  {'Class':20s} {'PQ':>6} {'SQ':>6} {'RQ':>6}  TP/FP/FN")
     print("-" * 60)
     for cid in range(NUM_GNN_CLS):
-        if cc[cid] == 0: continue
-        t    = "Thing" if cid in THING_CLASSES else "Stuff"
-        n    = cc[cid]
-        pq_v = cpq[cid] / n * 100
-        sq_v = csq[cid] / n * 100
-        rq_v = crq[cid] / n * 100
+        if (tp_cls[cid] + fp_cls[cid] + fn_cls[cid]) == 0: continue
+        t = "Thing" if cid in THING_CLASSES else "Stuff"
         print(f"[{t:5s}] {CLASS_NAMES[cid]:20s}"
-              f" {pq_v:5.1f}% {sq_v:5.1f}% {rq_v:5.1f}%  (n={n})")
+              f" {PQ[cid]*100:5.1f}% {SQ[cid]*100:5.1f}% {RQ[cid]*100:5.1f}%"
+              f"  ({int(tp_cls[cid])}/{int(fp_cls[cid])}/{int(fn_cls[cid])})")
     print("=" * 60)
 
 

@@ -40,39 +40,55 @@ def compute_iou_log(pred_ents, gt_ents, el):
     return iw / (uw + 1e-8)
 
 
+def match_instances(pred_inst, gt_inst, el, cid):
+    """단일 클래스에 대해 TP/FP/FN/iou_sum을 글로벌 누적용으로 반환"""
+    pc = [p for p in pred_inst if p['label'] == cid]
+    gc = [g for g in gt_inst if g['label'] == cid]
+    if not gc and not pc:
+        return 0, 0, 0, 0.0
+
+    TP, FP, FN, iou_sum = 0, 0, 0, 0.0
+    matched = set()
+
+    if cid in STUFF_CLASSES:
+        if not pc or not gc:
+            FP += len(pc); FN += len(gc)
+        else:
+            iou = compute_iou_log(pc[0]['entities'], gc[0]['entities'], el)
+            if iou > 0.5:
+                TP, iou_sum = 1, iou
+            else:
+                FP, FN = 1, 1
+    else:
+        for p in pc:
+            bi, bg = 0.0, -1
+            for gi, g in enumerate(gc):
+                iou = compute_iou_log(p['entities'], g['entities'], el)
+                if iou > bi: bi, bg = iou, gi
+            if bi > 0.5 and bg not in matched:
+                TP += 1; iou_sum += bi; matched.add(bg)
+            else:
+                FP += 1
+        FN = len(gc) - len(matched)
+
+    return TP, FP, FN, iou_sum
+
+
+# keep for backward compat (step3 import)
 def compute_pq(pred_inst, gt_inst, el, nc):
     pq, sq, rq = {}, {}, {}
     for cid in range(nc):
-        pc = [p for p in pred_inst if p['label'] == cid]
-        gc = [g for g in gt_inst  if g['label'] == cid]
-        if not gc and not pc: continue
-        TP, FP, FN, iou_sum = 0, 0, 0, 0.0
-        matched = set()
-        if cid in STUFF_CLASSES:
-            if not pc or not gc: FP += len(pc); FN += len(gc)
-            else:
-                iou = compute_iou_log(pc[0]['entities'], gc[0]['entities'], el)
-                if iou > 0.5: TP, iou_sum = 1, iou
-                else: FP, FN = 1, 1
-        else:
-            for p in pc:
-                bi, bg = 0.0, -1
-                for gi, g in enumerate(gc):
-                    iou = compute_iou_log(p['entities'], g['entities'], el)
-                    if iou > bi: bi, bg = iou, gi
-                if bi > 0.5 and bg not in matched:
-                    TP += 1; iou_sum += bi; matched.add(bg)
-                else: FP += 1
-            FN = len(gc) - len(matched)
-        r = TP / (TP + 0.5 * FP + 0.5 * FN + 1e-8)
-        s = iou_sum / (TP + 1e-8) if TP > 0 else 0.0
+        tp, fp, fn, iou_s = match_instances(pred_inst, gt_inst, el, cid)
+        if tp + fp + fn == 0: continue
+        r = tp / (tp + 0.5 * fp + 0.5 * fn + 1e-8)
+        s = iou_s / (tp + 1e-8) if tp > 0 else 0.0
         pq[cid], sq[cid], rq[cid] = r * s, s, r
     return pq, sq, rq
 
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("PanCADNet v2 — PQ / SQ / RQ  +  F1 / wF1 (논문 동일 방식)")
+    print("PanCADNet v2 — PQ / SQ / RQ  +  F1 / wF1 (글로벌 집계)")
     print("=" * 70)
 
     file_ids, j_dict, p_dict = get_valid_files()
@@ -88,8 +104,12 @@ if __name__ == "__main__":
     model.eval()
     print(f"Loaded: {cp}\n")
 
-    cpq = defaultdict(float); csq = defaultdict(float)
-    crq = defaultdict(float); cc  = defaultdict(int)
+    # ── 글로벌 누적 (DPSS 방식) ──
+    tp_cls = np.zeros(NUM_GNN_CLS, dtype=np.float64)
+    fp_cls = np.zeros(NUM_GNN_CLS, dtype=np.float64)
+    fn_cls = np.zeros(NUM_GNN_CLS, dtype=np.float64)
+    iou_cls = np.zeros(NUM_GNN_CLS, dtype=np.float64)
+
     all_pred, all_gt = [], []
 
     with torch.no_grad():
@@ -108,68 +128,72 @@ if __name__ == "__main__":
 
             pc  = pc_list[0].float().cpu()
             pm  = pm_list[0].float().cpu()
-            sem = sem_list[0].float().cpu()     # (N, C)
+            sem = sem_list[0].float().cpu()
 
-            # PQ / SQ / RQ
             pi = extract_pred_instances(pc, pm)
             gi = extract_gt_instances(sample['gt_labels'], sample['gt_masks'])
             el = {i: float(sample['geo_features'][i, 0].item() * SCALE_ORG)
                   for i in range(sample['num_primitives'])}
-            p, sq_d, r = compute_pq(pi, gi, el, NUM_GNN_CLS)
-            for cid in p:
-                cpq[cid] += p[cid]; csq[cid] += sq_d[cid]
-                crq[cid] += r[cid]; cc[cid]  += 1
 
-            # F1 / wF1 — 논문과 동일: sem_logits argmax
+            for cid in range(NUM_GNN_CLS):
+                tp, fp, fn, iou_s = match_instances(pi, gi, el, cid)
+                tp_cls[cid] += tp
+                fp_cls[cid] += fp
+                fn_cls[cid] += fn
+                iou_cls[cid] += iou_s
+
             pred_cls = sem.argmax(-1).numpy()
             gt_cls   = sample['sem_labels'].numpy()
             all_pred.extend(pred_cls.tolist())
             all_gt.extend(gt_cls.tolist())
 
-    # ── 집계 ─────────────────────────────────────────────────────
-    def avg(ms, cls_list):
-        v = [c for c in cls_list if cc[c] > 0]
-        return sum(ms[c] / cc[c] for c in v) / len(v) * 100 if v else 0.0
+    # ── PQ/SQ/RQ 계산 (글로벌) ──
+    RQ = tp_cls / (tp_cls + 0.5 * fp_cls + 0.5 * fn_cls + 1e-8)
+    SQ = iou_cls / (tp_cls + 1e-8)
+    SQ[tp_cls == 0] = 0.0
+    PQ = RQ * SQ
 
-    y_true  = np.array(all_gt);  y_pred = np.array(all_pred)
-    labels  = list(range(NUM_GNN_CLS))
-    f1_mac  = f1_score(y_true, y_pred, labels=labels, average='macro',    zero_division=0) * 100
-    f1_wgt  = f1_score(y_true, y_pred, labels=labels, average='weighted', zero_division=0) * 100
-    f1_cls  = f1_score(y_true, y_pred, labels=labels, average=None,       zero_division=0) * 100
+    def cls_avg(arr, cls_list):
+        valid = [c for c in cls_list if (tp_cls[c] + fp_cls[c] + fn_cls[c]) > 0]
+        return np.mean(arr[valid]) * 100 if valid else 0.0
+
+    y_true = np.array(all_gt); y_pred = np.array(all_pred)
+    labels = list(range(NUM_GNN_CLS))
+    f1_mac = f1_score(y_true, y_pred, labels=labels, average='macro',    zero_division=0) * 100
+    f1_wgt = f1_score(y_true, y_pred, labels=labels, average='weighted', zero_division=0) * 100
+    f1_cls = f1_score(y_true, y_pred, labels=labels, average=None,       zero_division=0) * 100
 
     thing_f1 = np.mean([f1_cls[c] for c in THING_CLASSES if c < len(f1_cls)])
     stuff_f1 = np.mean([f1_cls[c] for c in STUFF_CLASSES if c < len(f1_cls)])
 
-    # ── 출력 ─────────────────────────────────────────────────────
     print("=" * 70)
     print(f"{'':8s} {'PQ':>7} {'SQ':>7} {'RQ':>7} {'F1':>7} {'wF1':>7}")
     print("-" * 70)
     print(f"{'Total':8s}"
-          f" {avg(cpq, range(NUM_GNN_CLS)):6.2f}%"
-          f" {avg(csq, range(NUM_GNN_CLS)):6.2f}%"
-          f" {avg(crq, range(NUM_GNN_CLS)):6.2f}%"
+          f" {cls_avg(PQ, range(NUM_GNN_CLS)):6.2f}%"
+          f" {cls_avg(SQ, range(NUM_GNN_CLS)):6.2f}%"
+          f" {cls_avg(RQ, range(NUM_GNN_CLS)):6.2f}%"
           f" {f1_mac:6.2f}% {f1_wgt:6.2f}%")
     print(f"{'Thing':8s}"
-          f" {avg(cpq, THING_CLASSES):6.2f}%"
-          f" {avg(csq, THING_CLASSES):6.2f}%"
-          f" {avg(crq, THING_CLASSES):6.2f}%"
+          f" {cls_avg(PQ, THING_CLASSES):6.2f}%"
+          f" {cls_avg(SQ, THING_CLASSES):6.2f}%"
+          f" {cls_avg(RQ, THING_CLASSES):6.2f}%"
           f" {thing_f1:6.2f}%")
     print(f"{'Stuff':8s}"
-          f" {avg(cpq, STUFF_CLASSES):6.2f}%"
-          f" {avg(csq, STUFF_CLASSES):6.2f}%"
-          f" {avg(crq, STUFF_CLASSES):6.2f}%"
+          f" {cls_avg(PQ, STUFF_CLASSES):6.2f}%"
+          f" {cls_avg(SQ, STUFF_CLASSES):6.2f}%"
+          f" {cls_avg(RQ, STUFF_CLASSES):6.2f}%"
           f" {stuff_f1:6.2f}%")
     print("=" * 70)
 
-    print(f"\n{'Type':5s}  {'Class':20s} {'PQ':>6} {'SQ':>6} {'RQ':>6} {'F1':>6}  n")
+    print(f"\n{'Type':5s}  {'Class':20s} {'PQ':>6} {'SQ':>6} {'RQ':>6} {'F1':>6}  TP/FP/FN")
     print("-" * 70)
     for cid in range(NUM_GNN_CLS):
-        if cc[cid] == 0 and (cid >= len(f1_cls) or f1_cls[cid] == 0): continue
-        t    = "Thing" if cid in THING_CLASSES else "Stuff"
-        n    = int(cc[cid])
-        pq_v = cpq[cid] / cc[cid] * 100 if cc[cid] > 0 else 0.0
-        sq_v = csq[cid] / cc[cid] * 100 if cc[cid] > 0 else 0.0
-        rq_v = crq[cid] / cc[cid] * 100 if cc[cid] > 0 else 0.0
-        fv   = f1_cls[cid] if cid < len(f1_cls) else 0.0
+        has_data = (tp_cls[cid] + fp_cls[cid] + fn_cls[cid]) > 0
+        has_f1 = cid < len(f1_cls) and f1_cls[cid] > 0
+        if not has_data and not has_f1: continue
+        t  = "Thing" if cid in THING_CLASSES else "Stuff"
+        fv = f1_cls[cid] if cid < len(f1_cls) else 0.0
         print(f"[{t:5s}] {CLASS_NAMES[cid]:20s}"
-              f" {pq_v:5.1f}% {sq_v:5.1f}% {rq_v:5.1f}% {fv:5.1f}%  (n={n})")
+              f" {PQ[cid]*100:5.1f}% {SQ[cid]*100:5.1f}% {RQ[cid]*100:5.1f}%"
+              f" {fv:5.1f}%  ({int(tp_cls[cid])}/{int(fp_cls[cid])}/{int(fn_cls[cid])})")
