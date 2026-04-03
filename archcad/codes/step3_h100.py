@@ -15,7 +15,7 @@ SAMPLES_PER_EPOCH = 20000
 
 # ── Dataset ──────────────────────────────────────────────────────
 class CachedDataset(Dataset):
-    def __init__(self, file_ids, cache_dir="/content/graph_cache_v2"):
+    def __init__(self, file_ids, cache_dir=GRAPH_DIR):
         self.paths = [os.path.join(cache_dir, f"{fid}.pt") for fid in file_ids
                       if os.path.exists(os.path.join(cache_dir, f"{fid}.pt"))]
     def __len__(self): return len(self.paths)
