@@ -100,7 +100,7 @@ def train_one_epoch(model, dl, criterion, optimizer, scaler, epoch):
                 for k in d: d[k] += ld.get(k, 0)
                 valid  += 1
             if valid > 0: loss = loss / valid
-        if not torch.isfinite(loss) or loss.item() > 100:
+        if not torch.isfinite(loss) or loss.item() > 20:
             optimizer.zero_grad(); continue
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -255,11 +255,17 @@ if __name__ == "__main__":
 
     bp = [p for n, p in model.named_parameters() if 'backbone' in n]
     op = [p for n, p in model.named_parameters() if 'backbone' not in n]
+    BASE_LR = 1e-4  # 2e-4 → 1e-4 (안정성)
     optimizer = torch.optim.AdamW(
-        [{'params': bp, 'lr': LR * 0.1}, {'params': op, 'lr': LR}],
+        [{'params': bp, 'lr': BASE_LR * 0.1}, {'params': op, 'lr': BASE_LR}],
         weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=TOTAL_EPOCHS, eta_min=1e-6)
+    WARMUP_EPOCHS = 3
+    def lr_lambda(epoch):
+        if epoch < WARMUP_EPOCHS:
+            return (epoch + 1) / WARMUP_EPOCHS  # linear warmup
+        progress = (epoch - WARMUP_EPOCHS) / (TOTAL_EPOCHS - WARMUP_EPOCHS)
+        return 0.5 * (1 + np.cos(np.pi * progress))  # cosine decay
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler = torch.amp.GradScaler('cuda')
 
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
