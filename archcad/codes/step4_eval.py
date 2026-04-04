@@ -96,7 +96,7 @@ if __name__ == "__main__":
     test_ds = PanCADDataset(file_ids[s2:], j_dict, p_dict)
     test_dl = torch.utils.data.DataLoader(
         test_ds, batch_size=1, shuffle=False,
-        num_workers=4, collate_fn=lambda b: b[0])
+        num_workers=0, collate_fn=lambda b: b[0])
 
     model = PanCADNetV2().to(DEVICE)
     cp = os.path.join(MODEL_OUT, "best_pancadnet_v2.pt")

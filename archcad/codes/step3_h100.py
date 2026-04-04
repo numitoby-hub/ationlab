@@ -164,7 +164,7 @@ def evaluate_pq(model, ds):
     """CachedDataset 전체를 sample 단위로 순회해 PQ/SQ/RQ 계산"""
     model.eval()
     dl = DataLoader(ds, batch_size=1, shuffle=False,
-                    num_workers=2, collate_fn=lambda b: b[0])
+                    num_workers=0, collate_fn=lambda b: b[0])
 
     tp_cls = np.zeros(NUM_GNN_CLS, dtype=np.float64)
     fp_cls = np.zeros(NUM_GNN_CLS, dtype=np.float64)
