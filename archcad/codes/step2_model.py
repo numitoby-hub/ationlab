@@ -124,7 +124,7 @@ class AdaptiveFusion(nn.Module):
 
 
 class MaskedTransformerDecoderLayer(nn.Module):
-    """Mask2Former 핵심: masked cross-attention으로 query가 특정 인스턴스에 집중하게 함"""
+    """Mask2Former: masked cross-attention"""
     def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1):
         super().__init__()
         self.self_attn  = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
@@ -138,16 +138,11 @@ class MaskedTransformerDecoderLayer(nn.Module):
         self.drop  = nn.Dropout(dropout)
 
     def forward(self, q, mem, attn_mask=None):
-        # self-attention among queries
         q2, _ = self.self_attn(q, q, q)
         q = self.norm1(q + self.drop(q2))
 
-        # masked cross-attention: 이전 layer mask가 낮은 영역은 attend 금지
         if attn_mask is not None:
-            # attn_mask: (Q, N) bool, True = attend 금지
-            # MultiheadAttention은 (B*nhead, Q, N) 형태 필요 → nhead 반복
             nhead = self.cross_attn.num_heads
-            # (1, Q, N) → (nhead, Q, N)
             key_mask = attn_mask.unsqueeze(0).expand(nhead, -1, -1)
             key_mask = key_mask.float().masked_fill(key_mask, float('-inf'))
         else:
@@ -177,54 +172,50 @@ class PrimitiveMask2FormerDecoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim))
         self.prim_proj = nn.Linear(hidden_dim, hidden_dim)
-
-        # ── 논문과 동일한 semantic head: primitive별 직접 클래스 예측 ──
         self.sem_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(),
-            nn.Linear(hidden_dim, num_classes))   # (N, C)  배경 없음
+            nn.Linear(hidden_dim, num_classes))
 
     def forward(self, fused):
-        pe  = self.prim_proj(fused)                # (N, D)
-        mem = fused.unsqueeze(0)                   # (1, N, D)
-        q   = self.query_embed.weight.unsqueeze(0) # (1, Q, D)
+        pe  = self.prim_proj(fused)
+        mem = fused.unsqueeze(0)
+        q   = self.query_embed.weight.unsqueeze(0)
 
-        attn_mask = None                           # 첫 layer는 제한 없음
+        attn_mask = None
         aux_outputs = []
 
         for layer in self.layers:
             q = layer(q, mem, attn_mask=attn_mask)
-
-            # 현재 q로 mask 예측 → 다음 layer의 attention mask 생성
             me = self.mask_head(q.squeeze(0))
-            curr_mask = torch.mm(me, pe.T)          # (Q, N)
+            curr_mask = torch.mm(me, pe.T)
             aux_outputs.append((self.cls_head(q.squeeze(0)), curr_mask))
-
-            # sigmoid < 0.5인 영역은 다음 layer에서 attend 금지
-            attn_mask = (curr_mask.sigmoid() < 0.5)  # (Q, N)
-            # 전체 막혀있으면 전부 허용 (안정성)
+            attn_mask = (curr_mask.sigmoid() < 0.5)
             all_masked = attn_mask.all(dim=-1, keepdim=True)
             attn_mask = attn_mask & ~all_masked
 
-        # 최종 출력
         q_final = q.squeeze(0)
-        cls   = self.cls_head(q_final)              # (Q, C+1)
+        cls   = self.cls_head(q_final)
         me    = self.mask_head(q_final)
-        masks = torch.mm(me, pe.T)                  # (Q, N)
+        masks = torch.mm(me, pe.T)
 
-        # semantic branch (논문 방식, F1/wF1 계산용)
-        sem_logits = self.sem_head(fused)            # (N, C)
+        sem_logits = self.sem_head(fused)
+        sem_logits = sem_logits.clamp(-30, 30)  # fp16 overflow 방지
 
         return cls, masks, sem_logits, aux_outputs
 
 
 class PanopticLoss(nn.Module):
-    def __init__(self, num_classes=NUM_GNN_CLS, lc=LAMBDA_CLS, lb=LAMBDA_BCE, ld=LAMBDA_DICE):
+    def __init__(self, num_classes=NUM_GNN_CLS, lc=LAMBDA_CLS, lb=LAMBDA_BCE, ld=LAMBDA_DICE,
+                 class_weights=None):
         super().__init__()
         self.nc = num_classes
         self.lc, self.lb, self.ld = lc, lb, ld
-        cw = torch.ones(num_classes + 1)
-        cw[-1] = 0.1
-        self.register_buffer('cw', cw)
+        if class_weights is not None:
+            self.register_buffer('cw', class_weights)
+        else:
+            cw = torch.ones(num_classes + 1)
+            cw[-1] = 0.1
+            self.register_buffer('cw', cw)
 
     @torch.no_grad()
     def hungarian_match(self, pc, pm, gl, gm):
@@ -248,7 +239,6 @@ class PanopticLoss(nn.Module):
         return torch.tensor(pi, dtype=torch.long), torch.tensor(gi, dtype=torch.long)
 
     def _single_loss(self, pc, pm, gl, gm, dev):
-        """단일 (cls, mask) 쌍에 대한 cls + bce + dice + overlap 계산"""
         Q = pc.shape[0]
         pi, gi = self.hungarian_match(pc, pm, gl, gm)
         pi, gi = pi.to(dev), gi.to(dev)
@@ -265,8 +255,6 @@ class PanopticLoss(nn.Module):
             n      = 2 * (s * mg).sum(-1)
             d      = s.sum(-1) + mg.sum(-1)
             l_dice = (1 - (n + 1) / (d + 1)).mean()
-
-            # overlap 패널티: 매칭된 쿼리들의 mask 합이 1을 초과하면 벌점
             overlap = F.relu(s.sum(0) - 1.0)
             l_overlap = overlap.mean()
         else:
@@ -278,15 +266,6 @@ class PanopticLoss(nn.Module):
         return loss, l_cls, l_bce, l_dice, l_overlap
 
     def forward(self, pc, pm, sem, gl, gm, sem_labels, aux_outputs=None):
-        """
-        pc:          (Q, C+1)   panoptic cls logits
-        pm:          (Q, N)     panoptic mask logits
-        sem:         (N, C)     semantic logits
-        gl:          (M,)       gt instance labels
-        gm:          (M, N)     gt instance masks
-        sem_labels:  (N,)       gt semantic per primitive
-        aux_outputs: list of (cls, masks) from intermediate decoder layers
-        """
         dev = pc.device
 
         if not (torch.isfinite(pc).all() and torch.isfinite(pm).all()):
@@ -294,16 +273,15 @@ class PanopticLoss(nn.Module):
             return dummy, {'loss_cls': 0., 'loss_bce': 0., 'loss_dice': 0.,
                            'loss_sem': 0., 'loss_overlap': 0., 'loss_aux': 0., 'total': 0.}
 
-        # main loss (최종 layer)
         main_loss, l_cls, l_bce, l_dice, l_overlap = self._single_loss(pc, pm, gl, gm, dev)
 
-        # semantic loss
-        l_sem = F.cross_entropy(sem, sem_labels.to(dev), reduction='mean')
+        # semantic loss (가중치 0.5 + label_smoothing)
+        l_sem = 0.5 * F.cross_entropy(sem, sem_labels.to(dev), reduction='mean',
+                                       label_smoothing=0.1)
 
-        # auxiliary loss (중간 layer들, 가중치 0.5)
         l_aux = torch.tensor(0., device=dev)
         if aux_outputs is not None:
-            for aux_cls, aux_mask in aux_outputs[:-1]:  # 마지막은 main과 동일하므로 제외
+            for aux_cls, aux_mask in aux_outputs[:-1]:
                 if torch.isfinite(aux_cls).all() and torch.isfinite(aux_mask).all():
                     a_loss, _, _, _, _ = self._single_loss(aux_cls, aux_mask, gl, gm, dev)
                     l_aux = l_aux + a_loss

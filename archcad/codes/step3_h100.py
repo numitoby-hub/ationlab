@@ -5,26 +5,54 @@ from sklearn.metrics import f1_score
 from torch.utils.data import Dataset, DataLoader, Subset
 from config import *
 from step2_model import PanCADNetV2, PanopticLoss
-from step4_eval import extract_pred_instances, extract_gt_instances, compute_iou_log, compute_pq
+from step4_eval import extract_pred_instances, extract_gt_instances, compute_iou_log, match_instances
 from utils import get_valid_files
 
-TOTAL_EPOCHS      = 30
-BATCH_SIZE        = 8
+TOTAL_EPOCHS      = 50
+BATCH_SIZE        = 16
 SAMPLES_PER_EPOCH = 20000
 
 
 # ── Dataset ──────────────────────────────────────────────────────
 class CachedDataset(Dataset):
-    def __init__(self, file_ids, cache_dir="/content/graph_cache_v2"):
+    def __init__(self, file_ids, cache_dir=GRAPH_DIR, augment=False):
         self.paths = [os.path.join(cache_dir, f"{fid}.pt") for fid in file_ids
                       if os.path.exists(os.path.join(cache_dir, f"{fid}.pt"))]
-    def __len__(self): return len(self.paths)
-    def __getitem__(self, idx):
-        return torch.load(self.paths[idx], weights_only=False)
+        self.augment = augment
 
+    def __len__(self): return len(self.paths)
+
+    def __getitem__(self, idx):
+        sample = torch.load(self.paths[idx], weights_only=False)
+        if self.augment:
+            sample = self._augment(sample)
+        return sample
+
+    def _augment(self, sample):
+        s = dict(sample)
+        s['image'] = s['image'].clone()
+        s['starts'] = s['starts'].clone()
+        s['ends'] = s['ends'].clone()
+
+        # h-flip (p=0.5)
+        if random.random() < 0.5:
+            s['image'] = s['image'].flip(-1)
+            s['starts'][:, 0] = SCALE_ORG - s['starts'][:, 0]
+            s['ends'][:, 0] = SCALE_ORG - s['ends'][:, 0]
+
+        # v-flip (p=0.5)
+        if random.random() < 0.5:
+            s['image'] = s['image'].flip(-2)
+            s['starts'][:, 1] = SCALE_ORG - s['starts'][:, 1]
+            s['ends'][:, 1] = SCALE_ORG - s['ends'][:, 1]
+
+        return s
+
+
+MAX_PRIMITIVES = 3000
 
 def collate_batch(samples):
-    samples = [s for s in samples if s['num_primitives'] >= 2]
+    samples = [s for s in samples if 2 <= s['num_primitives'] <= MAX_PRIMITIVES]
     if not samples: return None
     images    = torch.stack([s['image'] for s in samples])
     Ns        = [s['num_primitives'] for s in samples]
@@ -32,7 +60,7 @@ def collate_batch(samples):
     geo       = torch.cat([s['geo_features'] for s in samples])
     starts    = torch.cat([s['starts'] for s in samples])
     ends      = torch.cat([s['ends'] for s in samples])
-    sem_labels = torch.cat([s['sem_labels'] for s in samples])   # (N_total,)
+    sem_labels = torch.cat([s['sem_labels'] for s in samples])
     num_scales = len(samples[0]['edge_index_list'])
     eil_batched, eal_batched = [], []
     for k in range(num_scales):
@@ -66,8 +94,28 @@ def make_loader(dataset, n_samples, batch_size, shuffle=True):
                       num_workers=2, collate_fn=collate_batch, pin_memory=True)
 
 
+# ── Class weights ────────────────────────────────────────────────
+def compute_class_weights(dataset, num_classes=NUM_GNN_CLS):
+    """sqrt inverse frequency class weights from training data"""
+    counts = torch.zeros(num_classes)
+    for path in tqdm(dataset.paths[:2000], desc="Computing class weights"):
+        sample = torch.load(path, weights_only=False)
+        sem = sample['sem_labels']
+        for c in range(num_classes):
+            counts[c] += (sem == c).sum().item()
+    counts = counts.clamp(min=1)
+    weights = 1.0 / counts.sqrt()
+    weights = weights / weights.mean()  # normalize to mean ~1
+    cw = torch.ones(num_classes + 1)
+    cw[:num_classes] = weights
+    cw[-1] = 0.3  # nothing class
+    print(f"Class weights (min={cw[:num_classes].min():.3f}, "
+          f"max={cw[:num_classes].max():.3f}, nothing={cw[-1]:.1f})")
+    return cw
+
+
 # ── Train ────────────────────────────────────────────────────────
-def train_one_epoch(model, dl, criterion, optimizer, scaler, epoch):
+def train_one_epoch(model, dl, criterion, optimizer, epoch):
     model.train()
     total_loss, steps = 0, 0
     d = {'loss_cls': 0, 'loss_bce': 0, 'loss_dice': 0, 'loss_sem': 0, 'loss_overlap': 0, 'loss_aux': 0}
@@ -80,9 +128,9 @@ def train_one_epoch(model, dl, criterion, optimizer, scaler, epoch):
         eil     = [x.to(DEVICE) for x in batch['edge_index_list']]
         eal     = [x.to(DEVICE) for x in batch['edge_attr_list']]
         bidx    = batch['batch_idx'].to(DEVICE)
-        sem_all = batch['sem_labels'].to(DEVICE)   # (N_total,)
+        sem_all = batch['sem_labels'].to(DEVICE)
         optimizer.zero_grad()
-        with torch.amp.autocast('cuda'):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             pc_list, pm_list, sem_list, aux_list = model(img, s, e, geo, eil, eal, bidx)
             loss   = torch.tensor(0., device=DEVICE)
             valid  = 0
@@ -100,16 +148,15 @@ def train_one_epoch(model, dl, criterion, optimizer, scaler, epoch):
             if valid > 0: loss = loss / valid
         if not torch.isfinite(loss):
             optimizer.zero_grad(); continue
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer); scaler.update()
+        optimizer.step()
         total_loss += loss.item(); steps += 1
     if steps == 0: return 0, {}
     return total_loss / steps, {k: v / steps for k, v in d.items()}
 
 
-# ── Validate: loss + F1(논문 방식) ───────────────────────────────
+# ── Validate ─────────────────────────────────────────────────────
 @torch.no_grad()
 def validate(model, dl, criterion):
     model.eval()
@@ -127,7 +174,7 @@ def validate(model, dl, criterion):
         bidx    = batch['batch_idx'].to(DEVICE)
         sem_all = batch['sem_labels'].to(DEVICE)
 
-        with torch.amp.autocast('cuda'):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             pc_list, pm_list, sem_list, aux_list = model(img, s, e, geo, eil, eal, bidx)
             loss   = torch.tensor(0., device=DEVICE)
             valid  = 0
@@ -141,7 +188,6 @@ def validate(model, dl, criterion):
                 l, _       = criterion(pc, pm, sem, gl_d, gm_d, sem_lbl, aux_outputs=aux)
                 loss = loss + l; valid += 1
 
-                # ── 논문 방식: sem_logits argmax → wF1 ──────────
                 pred_cls = sem.float().argmax(-1).cpu().numpy()
                 gt_cls   = sem_lbl.cpu().numpy()
                 all_pred.extend(pred_cls.tolist())
@@ -157,16 +203,17 @@ def validate(model, dl, criterion):
     return val_loss, f1_mac, f1_wgt
 
 
-# ── 최종 PQ 평가 (학습 끝난 후) ──────────────────────────────────
+# ── PQ 평가 (글로벌 누적) ────────────────────────────────────────
 @torch.no_grad()
 def evaluate_pq(model, ds):
-    """CachedDataset 전체를 sample 단위로 순회해 PQ/SQ/RQ 계산"""
     model.eval()
     dl = DataLoader(ds, batch_size=1, shuffle=False,
-                    num_workers=2, collate_fn=lambda b: b[0])
+                    num_workers=0, collate_fn=lambda b: b[0])
 
-    cpq = defaultdict(float); csq = defaultdict(float)
-    crq = defaultdict(float); cc  = defaultdict(int)
+    tp_cls = np.zeros(NUM_GNN_CLS, dtype=np.float64)
+    fp_cls = np.zeros(NUM_GNN_CLS, dtype=np.float64)
+    fn_cls = np.zeros(NUM_GNN_CLS, dtype=np.float64)
+    iou_cls = np.zeros(NUM_GNN_CLS, dtype=np.float64)
 
     for sample in tqdm(dl, desc="  PQ eval", leave=False):
         if sample['num_primitives'] < 2: continue
@@ -178,7 +225,7 @@ def evaluate_pq(model, ds):
         eal  = [x.to(DEVICE) for x in sample['edge_attr_list']]
         bidx = torch.zeros(sample['num_primitives'], dtype=torch.long, device=DEVICE)
 
-        with torch.amp.autocast('cuda'):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             pc_list, pm_list, _, _ = model(img, s, e, geo, eil, eal, bidx)
         pc = pc_list[0].float().cpu()
         pm = pm_list[0].float().cpu()
@@ -188,40 +235,44 @@ def evaluate_pq(model, ds):
         el = {i: float(sample['geo_features'][i, 0].item() * SCALE_ORG)
               for i in range(sample['num_primitives'])}
 
-        p, sq_d, r = compute_pq(pi, gi, el, NUM_GNN_CLS)
-        for cid in p:
-            cpq[cid] += p[cid]; csq[cid] += sq_d[cid]
-            crq[cid] += r[cid]; cc[cid]  += 1
+        for cid in range(NUM_GNN_CLS):
+            tp, fp, fn, iou_s = match_instances(pi, gi, el, cid)
+            tp_cls[cid] += tp
+            fp_cls[cid] += fp
+            fn_cls[cid] += fn
+            iou_cls[cid] += iou_s
 
-    def avg(ms, cls_list):
-        v = [c for c in cls_list if cc[c] > 0]
-        return sum(ms[c] / cc[c] for c in v) / len(v) * 100 if v else 0.0
+    RQ = tp_cls / (tp_cls + 0.5 * fp_cls + 0.5 * fn_cls + 1e-8)
+    SQ = iou_cls / (tp_cls + 1e-8)
+    SQ[tp_cls == 0] = 0.0
+    PQ = RQ * SQ
+
+    def cls_avg(arr, cls_list):
+        valid = [c for c in cls_list if (tp_cls[c] + fp_cls[c] + fn_cls[c]) > 0]
+        return np.mean(arr[valid]) * 100 if valid else 0.0
 
     print("\n" + "=" * 60)
-    print("Val PQ Results")
+    print("Val PQ Results (global)")
     print(f"{'':8s} {'PQ':>7} {'SQ':>7} {'RQ':>7}")
     print("-" * 40)
-    print(f"{'Total':8s} {avg(cpq, range(NUM_GNN_CLS)):6.2f}%"
-          f" {avg(csq, range(NUM_GNN_CLS)):6.2f}%"
-          f" {avg(crq, range(NUM_GNN_CLS)):6.2f}%")
-    print(f"{'Thing':8s} {avg(cpq, THING_CLASSES):6.2f}%"
-          f" {avg(csq, THING_CLASSES):6.2f}%"
-          f" {avg(crq, THING_CLASSES):6.2f}%")
-    print(f"{'Stuff':8s} {avg(cpq, STUFF_CLASSES):6.2f}%"
-          f" {avg(csq, STUFF_CLASSES):6.2f}%"
-          f" {avg(crq, STUFF_CLASSES):6.2f}%")
+    print(f"{'Total':8s} {cls_avg(PQ, range(NUM_GNN_CLS)):6.2f}%"
+          f" {cls_avg(SQ, range(NUM_GNN_CLS)):6.2f}%"
+          f" {cls_avg(RQ, range(NUM_GNN_CLS)):6.2f}%")
+    print(f"{'Thing':8s} {cls_avg(PQ, THING_CLASSES):6.2f}%"
+          f" {cls_avg(SQ, THING_CLASSES):6.2f}%"
+          f" {cls_avg(RQ, THING_CLASSES):6.2f}%")
+    print(f"{'Stuff':8s} {cls_avg(PQ, STUFF_CLASSES):6.2f}%"
+          f" {cls_avg(SQ, STUFF_CLASSES):6.2f}%"
+          f" {cls_avg(RQ, STUFF_CLASSES):6.2f}%")
     print("-" * 60)
-    print(f"{'Type':5s}  {'Class':20s} {'PQ':>6} {'SQ':>6} {'RQ':>6}  n")
+    print(f"{'Type':5s}  {'Class':20s} {'PQ':>6} {'SQ':>6} {'RQ':>6}  TP/FP/FN")
     print("-" * 60)
     for cid in range(NUM_GNN_CLS):
-        if cc[cid] == 0: continue
-        t    = "Thing" if cid in THING_CLASSES else "Stuff"
-        n    = cc[cid]
-        pq_v = cpq[cid] / n * 100
-        sq_v = csq[cid] / n * 100
-        rq_v = crq[cid] / n * 100
+        if (tp_cls[cid] + fp_cls[cid] + fn_cls[cid]) == 0: continue
+        t = "Thing" if cid in THING_CLASSES else "Stuff"
         print(f"[{t:5s}] {CLASS_NAMES[cid]:20s}"
-              f" {pq_v:5.1f}% {sq_v:5.1f}% {rq_v:5.1f}%  (n={n})")
+              f" {PQ[cid]*100:5.1f}% {SQ[cid]*100:5.1f}% {RQ[cid]*100:5.1f}%"
+              f"  ({int(tp_cls[cid])}/{int(fp_cls[cid])}/{int(fn_cls[cid])})")
     print("=" * 60)
 
 
@@ -234,23 +285,44 @@ if __name__ == "__main__":
 
     file_ids, _, _ = get_valid_files()
     s1 = int(len(file_ids) * 0.7); s2 = int(len(file_ids) * 0.8)
-    train_ds = CachedDataset(file_ids[:s1])
-    val_ds   = CachedDataset(file_ids[s1:s2])
+    train_ds = CachedDataset(file_ids[:s1], augment=True)
+    val_ds   = CachedDataset(file_ids[s1:s2], augment=False)
     print(f"Train pool: {len(train_ds)} | Val: {len(val_ds)}")
 
     val_dl = make_loader(val_ds, len(val_ds), BATCH_SIZE, shuffle=False)
 
-    model     = PanCADNetV2().to(DEVICE)
-    criterion = PanopticLoss().to(DEVICE)
+    model = PanCADNetV2().to(DEVICE)
 
-    bp = [p for n, p in model.named_parameters() if 'backbone' in n]
-    op = [p for n, p in model.named_parameters() if 'backbone' not in n]
-    optimizer = torch.optim.AdamW(
-        [{'params': bp, 'lr': LR * 0.1}, {'params': op, 'lr': LR}],
-        weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=TOTAL_EPOCHS, eta_min=1e-6)
-    scaler = torch.amp.GradScaler('cuda')
+    # ── sqrt inverse frequency class weights ──
+    cw = compute_class_weights(train_ds)
+    criterion = PanopticLoss(class_weights=cw).to(DEVICE)
+
+    # ── optimizer: backbone LR × 0.3 + 차등 WD ──
+    # backbone/gatv2/fusion → WD 0.1,  decoder/line_sampling → WD 0.01
+    BASE_LR = 1e-4
+    heavy_wd_keys = ('backbone', 'gatv2', 'fusion')
+    backbone_params, heavy_params, light_params = [], [], []
+    for n, p in model.named_parameters():
+        if 'backbone' in n:
+            backbone_params.append(p)
+        elif any(k in n for k in ('gatv2', 'fusion')):
+            heavy_params.append(p)
+        else:  # decoder, line_sampling
+            light_params.append(p)
+    optimizer = torch.optim.AdamW([
+        {'params': backbone_params, 'lr': BASE_LR * 0.3, 'weight_decay': 0.1},
+        {'params': heavy_params,    'lr': BASE_LR,        'weight_decay': 0.1},
+        {'params': light_params,    'lr': BASE_LR,        'weight_decay': 0.01},
+    ])
+
+    # ── warmup 3 epochs + cosine decay ──
+    WARMUP_EPOCHS = 3
+    def lr_lambda(epoch):
+        if epoch < WARMUP_EPOCHS:
+            return (epoch + 1) / WARMUP_EPOCHS
+        progress = (epoch - WARMUP_EPOCHS) / (TOTAL_EPOCHS - WARMUP_EPOCHS)
+        return 0.5 * (1 + np.cos(np.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     print(f"GPU: {torch.cuda.get_device_name()}\n")
@@ -258,7 +330,7 @@ if __name__ == "__main__":
     best_val = float('inf')
     for epoch in range(TOTAL_EPOCHS):
         train_dl = make_loader(train_ds, SAMPLES_PER_EPOCH, BATCH_SIZE)
-        tl, td   = train_one_epoch(model, train_dl, criterion, optimizer, scaler, epoch)
+        tl, td   = train_one_epoch(model, train_dl, criterion, optimizer, epoch)
         vl, f1_mac, f1_wgt = validate(model, val_dl, criterion)
         scheduler.step()
         lr = optimizer.param_groups[1]['lr']
@@ -288,7 +360,6 @@ if __name__ == "__main__":
 
     print(f"\nDone! Best val loss: {best_val:.4f}")
 
-    # ── 학습 완료 후 best 모델로 val PQ 계산 ──────────────────────
     print("\nLoading best model for PQ evaluation...")
     model.load_state_dict(
         torch.load(os.path.join(MODEL_OUT, "best_pancadnet_v2.pt"), map_location=DEVICE))
